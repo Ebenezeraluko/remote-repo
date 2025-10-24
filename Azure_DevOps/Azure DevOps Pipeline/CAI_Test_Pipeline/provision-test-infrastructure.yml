@@ -1,0 +1,120 @@
+# pipelines/provision-test-infrastructure.yml
+# Separate pipeline for provisioning test infrastructure
+
+trigger: none  # Manual trigger only
+
+pr: none
+
+variables:
+- group: 'Test-Environment-Variables'
+- name: testEnvironmentName
+  value: 'test'
+- name: terraformWorkingDirectory
+  value: '$(System.DefaultWorkingDirectory)/test'
+
+parameters:
+- name: action
+  displayName: 'Infrastructure Action'
+  type: string
+  default: 'apply'
+  values:
+  - 'apply'
+  - 'destroy'
+
+stages:
+- stage: ProvisionTestInfrastructure
+  displayName: 'Provision Test Infrastructure'
+  jobs:
+  - job: TerraformTestInfra
+    displayName: 'Deploy Test Infrastructure'
+    pool:
+      vmImage: 'ubuntu-latest'
+
+    steps:
+    - checkout: self
+
+    - task: TerraformInstaller@1
+      displayName: 'Install Terraform'
+      inputs:
+        terraformVersion: '1.6.0'
+
+    - task: TerraformTaskV4@4
+      displayName: 'Terraform Init'
+      inputs:
+        provider: 'azurerm'
+        command: 'init'
+        workingDirectory: '$(terraformWorkingDirectory)'
+        backendServiceArm: '$(azureServiceConnection)'
+        backendAzureRmResourceGroupName: 'mycai_test-rg'
+        backendAzureRmStorageAccountName: 'tfstatetestcai'
+        backendAzureRmContainerName: 'tfstatetestcai'
+        backendAzureRmKey: 'test.terraform.tfstate'
+
+    - task: TerraformTaskV4@4
+      displayName: 'Terraform Plan'
+      condition: eq('${{ parameters.action }}', 'apply')
+      inputs:
+        provider: 'azurerm'
+        command: 'plan'
+        workingDirectory: '$(terraformWorkingDirectory)'
+        environmentServiceNameAzureRM: '$(azureServiceConnection)'
+        commandOptions: '-out=tfplan'
+
+    - task: TerraformTaskV4@4
+      displayName: 'Terraform Apply'
+      condition: eq('${{ parameters.action }}', 'apply')
+      inputs:
+        provider: 'azurerm'
+        command: 'apply'
+        workingDirectory: '$(terraformWorkingDirectory)'
+        environmentServiceNameAzureRM: '$(azureServiceConnection)'
+        commandOptions: 'tfplan'
+
+    - task: TerraformTaskV4@4
+      displayName: 'Terraform Destroy'
+      condition: eq('${{ parameters.action }}', 'destroy')
+      inputs:
+        provider: 'azurerm'
+        command: 'destroy'
+        workingDirectory: '$(terraformWorkingDirectory)'
+        environmentServiceNameAzureRM: '$(azureServiceConnection)'
+        commandOptions: '-auto-approve'
+
+    - task: TerraformTaskV4@4
+      displayName: 'Get Terraform Outputs'
+      condition: eq('${{ parameters.action }}', 'apply')
+      name: TerraformOutputs
+      inputs:
+        provider: 'azurerm'
+        command: 'output'
+        workingDirectory: '$(terraformWorkingDirectory)'
+        outputTo: 'console'
+
+    - task: PowerShell@2
+      displayName: 'Extract Test Environment Configuration'
+      condition: eq('${{ parameters.action }}', 'apply')
+      name: TestConfig
+      inputs:
+        targetType: 'inline'
+        script: |
+          cd $(terraformWorkingDirectory)
+
+          # Extract Terraform outputs
+          $outputs = terraform output -json | ConvertFrom-Json
+
+          # Set pipeline variables
+          Write-Host "##vso[task.setVariable variable=clusterName;isOutput=true]$($outputs.cluster_name.value)"
+          Write-Host "##vso[task.setVariable variable=resourceGroupName;isOutput=true]$($outputs.resource_group_name.value)"
+          Write-Host "##vso[task.setVariable variable=keyVaultName;isOutput=true]$($outputs.key_vault_name.value)"
+          Write-Host "##vso[task.setVariable variable=keyVaultUri;isOutput=true]$($outputs.key_vault_uri.value)"
+          Write-Host "##vso[task.setVariable variable=sqlServerFqdn;isOutput=true]$($outputs.sql_server_fqdn.value)"
+          Write-Host "##vso[task.setVariable variable=testDatabaseName;isOutput=true]$($outputs.test_database_name.value)"
+
+          Write-Host "Test infrastructure provisioned successfully"
+
+    - task: PublishPipelineArtifact@1
+      displayName: 'Publish Kubeconfig'
+      condition: eq('${{ parameters.action }}', 'apply')
+      inputs:
+        targetPath: '$(terraformWorkingDirectory)/kubeconfig.yaml'
+        artifactName: 'test-kubeconfig'

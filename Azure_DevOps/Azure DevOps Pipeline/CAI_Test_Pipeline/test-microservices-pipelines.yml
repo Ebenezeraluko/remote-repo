@@ -1,0 +1,378 @@
+# pipelines/test-microservices-pipelines.yml
+# Test environment pipeline - assumes infrastructure is already provisioned
+
+trigger:
+  branches:
+    include:
+    - main
+    - develop
+    - feature/*
+    - release/*
+  paths:
+    include:
+    - services/*
+    - test/*
+    - charts/*
+    - pipelines/test-environment-pipeline.yml
+
+pr:
+  branches:
+    include:
+    - main
+    - develop
+
+variables:
+- group: 'Test-Environment-Variables'
+- name: testEnvironmentName
+  value: 'test'
+
+parameters:
+- name: runFullTestSuite
+  displayName: 'Run Full Test Suite'
+  type: boolean
+  default: true
+
+- name: servicesToTest
+  displayName: 'Services to Test (comma-separated or "all")'
+  type: string
+  default: 'all'
+
+- name: testType
+  displayName: 'Test Type'
+  type: string
+  default: 'integration'
+  values:
+  - 'unit'
+  - 'integration'
+  - 'e2e'
+  - 'load'
+  - 'all'
+
+- name: cleanupAfterTests
+  displayName: 'Cleanup Test Environment After Tests'
+  type: boolean
+  default: false
+
+- name: clusterName
+  displayName: 'Test AKS Cluster Name'
+  type: string
+  default: 'mycai-test-aks'
+
+- name: resourceGroupName
+  displayName: 'Resource Group Name'
+  type: string
+  default: 'mycai_test-rg'
+
+- name: keyVaultName
+  displayName: 'Key Vault Name'
+  type: string
+  default: 'mycai-test-kv'
+
+stages:
+# Stage 1: Build Services for Testing
+- stage: BuildServicesForTesting
+  displayName: 'Build Services for Testing'
+  jobs:
+  - template: templates/build-services-enhanced.yml
+    parameters:
+      servicesToBuild: ${{ parameters.servicesToTest }}
+      buildConfiguration: 'Debug'  # Include debug symbols for testing
+      enableTestCoverage: true
+      targetEnvironment: 'test'
+
+# Stage 2: Deploy Test Dependencies
+- stage: DeployTestDependencies
+  displayName: 'Deploy Test Dependencies'
+  dependsOn: BuildServicesForTesting
+  
+  jobs:
+  - job: DeployTestDependencies
+    displayName: 'Deploy Test Dependencies'
+    pool:
+      vmImage: 'ubuntu-latest'
+
+    steps:
+    - checkout: self
+
+    - task: HelmInstaller@1
+      displayName: 'Install Helm'
+      inputs:
+        helmVersionToInstall: '3.12.0'
+    
+    - task: AzureCLI@2
+      displayName: 'Setup Kubernetes Context'
+      inputs:
+        azureSubscription: '$(azureServiceConnection)'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          # Get AKS credentials
+          az aks get-credentials \
+            --resource-group ${{ parameters.resourceGroupName }} \
+            --name ${{ parameters.clusterName }} \
+            --overwrite-existing
+
+          # Verify cluster connectivity
+          kubectl cluster-info
+
+          # Create test namespace
+          kubectl create namespace test --dry-run=client -o yaml | kubectl apply -f -
+
+          # Set default namespace
+          kubectl config set-context --current --namespace=test
+    
+    - task: PowerShell@2
+      displayName: 'Deploy Redis for Testing'
+      inputs:
+        targetType: 'inline'
+        script: |
+          # Add Bitnami repo
+          helm repo add bitnami https://charts.bitnami.com/bitnami
+          helm repo update
+          
+          # Deploy Redis with test configuration
+          helm upgrade --install redis-test bitnami/redis `
+            --namespace test `
+            --set auth.enabled=false `
+            --set replica.replicaCount=1 `
+            --set master.persistence.enabled=false `
+            --set replica.persistence.enabled=false `
+            --set master.resources.requests.memory=256Mi `
+            --set master.resources.requests.cpu=100m `
+            --wait --timeout=10m
+          
+          Write-Host "Redis deployed successfully for testing"
+    
+    - task: PowerShell@2
+      displayName: 'Deploy Test Message Queue'
+      inputs:
+        targetType: 'inline'
+        script: |
+          # Deploy RabbitMQ for testing
+          helm upgrade --install rabbitmq-test bitnami/rabbitmq `
+            --namespace test `
+            --set auth.username=testuser `
+            --set auth.password=testpass `
+            --set persistence.enabled=false `
+            --set resources.requests.memory=256Mi `
+            --set resources.requests.cpu=100m `
+            --set replicaCount=1 `
+            --wait --timeout=10m
+          
+          Write-Host "RabbitMQ deployed successfully for testing"
+    
+    - task: AzureCLI@2
+      displayName: 'Update Test Secrets in Key Vault'
+      inputs:
+        azureSubscription: '$(azureServiceConnection)'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          # Update Redis connection string
+          az keyvault secret set \
+            --vault-name "${{ parameters.keyVaultName }}" \
+            --name "redis-connection" \
+            --value "redis-test-master.test.svc.cluster.local:6379"
+
+          # Update RabbitMQ connection string
+          az keyvault secret set \
+            --vault-name "${{ parameters.keyVaultName }}" \
+            --name "rabbitmq-connection" \
+            --value "amqp://testuser:testpass@rabbitmq-test.test.svc.cluster.local:5672/"
+
+          echo "Test secrets updated in Key Vault"
+
+# Stage 3: Deploy Services to Test Environment
+- stage: DeployServicesToTest
+  displayName: 'Deploy Services to Test Environment'
+  dependsOn: DeployTestDependencies
+  
+  jobs:
+  - template: templates/deploy-services-test.yml
+    parameters:
+      environmentName: 'test'
+      servicesToDeploy: ${{ parameters.servicesToTest }}
+      keyVaultName: ${{ parameters.keyVaultName }}
+      enableDebugMode: true
+      enableTestEndpoints: true
+
+# Stage 4: Execute Test Suite
+- stage: ExecuteTestSuite
+  displayName: 'Execute Test Suite'
+  dependsOn: DeployServicesToTest
+  condition: and(succeeded(), eq('${{ parameters.runFullTestSuite }}', 'true'))
+  jobs:
+  - job: UnitTests
+    displayName: 'Unit Tests'
+    condition: or(eq('${{ parameters.testType }}', 'unit'), eq('${{ parameters.testType }}', 'all'))
+    pool:
+      vmImage: 'ubuntu-latest'
+    
+    steps:
+    - template: templates/run-unit-tests.yml
+      parameters:
+        servicesToTest: ${{ parameters.servicesToTest }}
+  
+  - job: IntegrationTests
+    displayName: 'Integration Tests'
+    condition: or(eq('${{ parameters.testType }}', 'integration'), eq('${{ parameters.testType }}', 'all'))
+    pool:
+      vmImage: 'ubuntu-latest'
+    
+    steps:
+    - template: templates/run-integration-tests.yml
+      parameters:
+        servicesToTest: ${{ parameters.servicesToTest }}
+        testEnvironment: 'test'
+        keyVaultName: ${{ parameters.keyVaultName }}
+  
+  - job: EndToEndTests
+    displayName: 'End-to-End Tests'
+    condition: or(eq('${{ parameters.testType }}', 'e2e'), eq('${{ parameters.testType }}', 'all'))
+    dependsOn: IntegrationTests
+    pool:
+      vmImage: 'ubuntu-latest'
+    
+    steps:
+    - template: templates/run-e2e-tests.yml
+      parameters:
+        servicesToTest: ${{ parameters.servicesToTest }}
+        testEnvironment: 'test'
+  
+  - job: LoadTests
+    displayName: 'Load Tests'
+    condition: or(eq('${{ parameters.testType }}', 'load'), eq('${{ parameters.testType }}', 'all'))
+    dependsOn: EndToEndTests
+    pool:
+      vmImage: 'ubuntu-latest'
+    
+    steps:
+    - template: templates/run-load-tests.yml
+      parameters:
+        servicesToTest: ${{ parameters.servicesToTest }}
+        testEnvironment: 'test'
+
+# Stage 5: Test Results Analysis
+- stage: TestResultsAnalysis
+  displayName: 'Test Results Analysis'
+  dependsOn: ExecuteTestSuite
+  condition: always()
+  jobs:
+  - job: AnalyzeTestResults
+    displayName: 'Analyze Test Results'
+    pool:
+      vmImage: 'ubuntu-latest'
+    
+    steps:
+    - task: DownloadPipelineArtifact@2
+      displayName: 'Download Test Results'
+      inputs:
+        artifactName: 'test-results'
+        targetPath: '$(System.ArtifactsDirectory)/test-results'
+      continueOnError: true
+    
+    - task: PowerShell@2
+      displayName: 'Generate Test Report'
+      inputs:
+        targetType: 'inline'
+        script: |
+          $testResultsPath = "$(System.ArtifactsDirectory)/test-results"
+
+          # Analyze test results
+          $testSummary = @{
+            TotalTests = 0
+            PassedTests = 0
+            FailedTests = 0
+            SkippedTests = 0
+            TestCoverage = "N/A"
+            TestDuration = "N/A"
+            Environment = "test"
+            Timestamp = Get-Date -Format "yyyy-MM-ddTHH:mm:ssZ"
+          }
+
+          # Parse test result files if they exist
+          if (Test-Path $testResultsPath) {
+            $testFiles = Get-ChildItem -Path $testResultsPath -Recurse -Filter "*.xml" -ErrorAction SilentlyContinue
+
+            foreach ($file in $testFiles) {
+              Write-Host "Processing test results from: $($file.Name)"
+              # Add logic to parse XML test results
+            }
+          }
+
+          # Generate HTML report using string builder to avoid YAML parsing issues
+          $html = New-Object System.Text.StringBuilder
+          [void]$html.AppendLine("<!DOCTYPE html>")
+          [void]$html.AppendLine("<html>")
+          [void]$html.AppendLine("<head>")
+          [void]$html.AppendLine("  <title>Test Environment Results</title>")
+          [void]$html.AppendLine("  <style>")
+          [void]$html.AppendLine("    body { font-family: Arial, sans-serif; margin: 20px; }")
+          [void]$html.AppendLine("    .summary { background-color: #f0f8ff; padding: 15px; border-radius: 5px; }")
+          [void]$html.AppendLine("    .passed { color: green; }")
+          [void]$html.AppendLine("    .failed { color: red; }")
+          [void]$html.AppendLine("    .skipped { color: orange; }")
+          [void]$html.AppendLine("  </style>")
+          [void]$html.AppendLine("</head>")
+          [void]$html.AppendLine("<body>")
+          [void]$html.AppendLine("  <h1>Test Environment Results</h1>")
+          [void]$html.AppendLine("  <div class=`"summary`">")
+          [void]$html.AppendLine("    <h2>Summary</h2>")
+          [void]$html.AppendLine("    <p><strong>Environment:</strong> $($testSummary.Environment)</p>")
+          [void]$html.AppendLine("    <p><strong>Timestamp:</strong> $($testSummary.Timestamp)</p>")
+          [void]$html.AppendLine("    <p><strong>Total Tests:</strong> $($testSummary.TotalTests)</p>")
+          [void]$html.AppendLine("    <p class=`"passed`"><strong>Passed:</strong> $($testSummary.PassedTests)</p>")
+          [void]$html.AppendLine("    <p class=`"failed`"><strong>Failed:</strong> $($testSummary.FailedTests)</p>")
+          [void]$html.AppendLine("    <p class=`"skipped`"><strong>Skipped:</strong> $($testSummary.SkippedTests)</p>")
+          [void]$html.AppendLine("    <p><strong>Coverage:</strong> $($testSummary.TestCoverage)</p>")
+          [void]$html.AppendLine("  </div>")
+          [void]$html.AppendLine("</body>")
+          [void]$html.AppendLine("</html>")
+
+          $html.ToString() | Out-File -FilePath "$(Build.ArtifactStagingDirectory)/test-report.html" -Encoding UTF8
+
+          Write-Host "Test analysis completed"
+    
+    - task: PublishPipelineArtifact@1
+      displayName: 'Publish Test Report'
+      inputs:
+        targetPath: '$(Build.ArtifactStagingDirectory)'
+        artifactName: 'test-analysis-report'
+
+# Stage 6: Cleanup Test Deployments (Optional)
+- stage: CleanupTestDeployments
+  displayName: 'Cleanup Test Deployments'
+  dependsOn: TestResultsAnalysis
+  condition: and(always(), eq('${{ parameters.cleanupAfterTests }}', 'true'))
+  jobs:
+  - job: CleanupDeployments
+    displayName: 'Cleanup Test Deployments'
+    pool:
+      vmImage: 'ubuntu-latest'
+
+    steps:
+    - task: AzureCLI@2
+      displayName: 'Cleanup Kubernetes Resources'
+      inputs:
+        azureSubscription: '$(azureServiceConnection)'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          # Get AKS credentials
+          az aks get-credentials \
+            --resource-group ${{ parameters.resourceGroupName }} \
+            --name ${{ parameters.clusterName }} \
+            --overwrite-existing
+
+          # Delete test namespace and all resources
+          kubectl delete namespace test --ignore-not-found=true
+
+          echo "Test deployments cleaned up successfully"
+
+    - task: PowerShell@2
+      displayName: 'Cleanup Summary'
+      inputs:
+        targetType: 'inline'
+        script: |
+          Write-Host "Test deployments cleaned up successfully"
+          Write-Host "Note: Infrastructure remains provisioned. Use the provision-test-infrastructure.yml pipeline to destroy infrastructure if needed."

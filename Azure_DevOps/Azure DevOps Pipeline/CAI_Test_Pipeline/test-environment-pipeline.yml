@@ -1,0 +1,501 @@
+# pipelines/test-environment-pipeline.yml
+# Complete test environment pipeline with automated testing
+
+trigger:
+  branches:
+    include:
+    - main
+    - develop
+    - feature/*
+    - release/*
+  paths:
+    include:
+    - services/*
+    - test/*
+    - charts/*
+    - pipelines/test-environment-pipeline.yml
+
+pr:
+  branches:
+    include:
+    - main
+    - develop
+
+variables:
+- group: 'Test-Environment-Variables'
+- name: testEnvironmentName
+  value: 'test'
+- name: terraformWorkingDirectory
+  value: '$(System.DefaultWorkingDirectory)/test'
+
+parameters:
+- name: runFullTestSuite
+  displayName: 'Run Full Test Suite'
+  type: boolean
+  default: true
+
+- name: servicesToTest
+  displayName: 'Services to Test (comma-separated or "all")'
+  type: string
+  default: 'all'
+
+- name: testType
+  displayName: 'Test Type'
+  type: string
+  default: 'integration'
+  values:
+  - 'unit'
+  - 'integration'
+  - 'e2e'
+  - 'load'
+  - 'all'
+
+- name: cleanupAfterTests
+  displayName: 'Cleanup Test Environment After Tests'
+  type: boolean
+  default: true
+
+stages:
+# Stage 1: Provision Test Infrastructure
+- stage: ProvisionTestInfrastructure
+  displayName: 'Provision Test Infrastructure'
+  jobs:
+  - job: TerraformTestInfra
+    displayName: 'Deploy Test Infrastructure'
+    pool:
+      vmImage: 'ubuntu-latest'
+    
+    steps:
+    - checkout: self
+    
+    - task: TerraformInstaller@1
+      displayName: 'Install Terraform'
+      inputs:
+        terraformVersion: '1.6.0'
+    
+    - task: TerraformTaskV4@4
+      displayName: 'Terraform Init'
+      inputs:
+        provider: 'azurerm'
+        command: 'init'
+        workingDirectory: '$(terraformWorkingDirectory)'
+        backendServiceArm: '$(azureServiceConnection)'
+        backendAzureRmResourceGroupName: 'mycai_test-rg'
+        backendAzureRmStorageAccountName: 'tfstatetestcai'
+        backendAzureRmContainerName: 'tfstatetestcai'
+        backendAzureRmKey: 'test.terraform.tfstate'
+    
+    - task: TerraformTaskV4@4
+      displayName: 'Terraform Plan'
+      inputs:
+        provider: 'azurerm'
+        command: 'plan'
+        workingDirectory: '$(terraformWorkingDirectory)'
+        environmentServiceNameAzureRM: '$(azureServiceConnection)'
+        commandOptions: '-out=tfplan'
+    
+    - task: TerraformTaskV4@4
+      displayName: 'Terraform Apply'
+      inputs:
+        provider: 'azurerm'
+        command: 'apply'
+        workingDirectory: '$(terraformWorkingDirectory)'
+        environmentServiceNameAzureRM: '$(azureServiceConnection)'
+        commandOptions: 'tfplan'
+    
+    - task: TerraformTaskV4@4
+      displayName: 'Get Terraform Outputs'
+      name: TerraformOutputs
+      inputs:
+        provider: 'azurerm'
+        command: 'output'
+        workingDirectory: '$(terraformWorkingDirectory)'
+        outputTo: 'console'
+    
+    - task: PowerShell@2
+      displayName: 'Extract Test Environment Configuration'
+      name: TestConfig
+      inputs:
+        targetType: 'inline'
+        script: |
+          cd $(terraformWorkingDirectory)
+          
+          # Extract Terraform outputs
+          $outputs = terraform output -json | ConvertFrom-Json
+          
+          # Set pipeline variables
+          Write-Host "##vso[task.setVariable variable=clusterName;isOutput=true]$($outputs.cluster_name.value)"
+          Write-Host "##vso[task.setVariable variable=resourceGroupName;isOutput=true]$($outputs.resource_group_name.value)"
+          Write-Host "##vso[task.setVariable variable=keyVaultName;isOutput=true]$($outputs.key_vault_name.value)"
+          Write-Host "##vso[task.setVariable variable=keyVaultUri;isOutput=true]$($outputs.key_vault_uri.value)"
+          Write-Host "##vso[task.setVariable variable=sqlServerFqdn;isOutput=true]$($outputs.sql_server_fqdn.value)"
+          Write-Host "##vso[task.setVariable variable=testDatabaseName;isOutput=true]$($outputs.test_database_name.value)"
+          
+          Write-Host "Test infrastructure provisioned successfully"
+    
+    - task: PublishPipelineArtifact@1
+      displayName: 'Publish Kubeconfig'
+      inputs:
+        targetPath: '$(terraformWorkingDirectory)/kubeconfig.yaml'
+        artifactName: 'test-kubeconfig'
+
+# Stage 2: Build Services for Testing
+- stage: BuildServicesForTesting
+  displayName: 'Build Services for Testing'
+  dependsOn: ProvisionTestInfrastructure
+  jobs:
+  - template: templates/build-services-enhanced.yml
+    parameters:
+      servicesToBuild: ${{ parameters.servicesToTest }}
+      buildConfiguration: 'Debug'  # Include debug symbols for testing
+      enableTestCoverage: true
+      targetEnvironment: 'test'
+
+# Stage 3: Deploy Test Dependencies
+- stage: DeployTestDependencies
+  displayName: 'Deploy Test Dependencies'
+  dependsOn: 
+    - ProvisionTestInfrastructure
+    - BuildServicesForTesting
+  variables:
+    clusterName: $[ dependencies.ProvisionTestInfrastructure.outputs['TerraformTestInfra.TestConfig.clusterName'] ]
+    resourceGroupName: $[ dependencies.ProvisionTestInfrastructure.outputs['TerraformTestInfra.TestConfig.resourceGroupName'] ]
+    keyVaultName: $[ dependencies.ProvisionTestInfrastructure.outputs['TerraformTestInfra.TestConfig.keyVaultName'] ]
+  
+  jobs:
+  - job: DeployTestDependencies
+    displayName: 'Deploy Test Dependencies'
+    pool:
+      vmImage: 'ubuntu-latest'
+    
+    steps:
+    - task: DownloadPipelineArtifact@2
+      displayName: 'Download Kubeconfig'
+      inputs:
+        artifactName: 'test-kubeconfig'
+        targetPath: '$(System.ArtifactsDirectory)'
+    
+    - task: HelmInstaller@1
+      displayName: 'Install Helm'
+      inputs:
+        helmVersionToInstall: '3.12.0'
+    
+    - task: AzureCLI@2
+      displayName: 'Setup Kubernetes Context'
+      inputs:
+        azureSubscription: '$(azureServiceConnection)'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          # Use downloaded kubeconfig
+          export KUBECONFIG=$(System.ArtifactsDirectory)/kubeconfig.yaml
+          
+          # Verify cluster connectivity
+          kubectl cluster-info
+          
+          # Create test namespace
+          kubectl create namespace test --dry-run=client -o yaml | kubectl apply -f -
+          
+          # Set default namespace
+          kubectl config set-context --current --namespace=test
+    
+    - task: PowerShell@2
+      displayName: 'Deploy Redis for Testing'
+      inputs:
+        targetType: 'inline'
+        script: |
+          # Set kubeconfig
+          $env:KUBECONFIG = "$(System.ArtifactsDirectory)/kubeconfig.yaml"
+          
+          # Add Bitnami repo
+          helm repo add bitnami https://charts.bitnami.com/bitnami
+          helm repo update
+          
+          # Deploy Redis with test configuration
+          helm upgrade --install redis-test bitnami/redis `
+            --namespace test `
+            --set auth.enabled=false `
+            --set replica.replicaCount=1 `
+            --set master.persistence.enabled=false `
+            --set replica.persistence.enabled=false `
+            --set master.resources.requests.memory=256Mi `
+            --set master.resources.requests.cpu=100m `
+            --wait --timeout=10m
+          
+          Write-Host "Redis deployed successfully for testing"
+    
+    - task: PowerShell@2
+      displayName: 'Deploy Test Message Queue'
+      inputs:
+        targetType: 'inline'
+        script: |
+          $env:KUBECONFIG = "$(System.ArtifactsDirectory)/kubeconfig.yaml"
+          
+          # Deploy RabbitMQ for testing
+          helm upgrade --install rabbitmq-test bitnami/rabbitmq `
+            --namespace test `
+            --set auth.username=testuser `
+            --set auth.password=testpass `
+            --set persistence.enabled=false `
+            --set resources.requests.memory=256Mi `
+            --set resources.requests.cpu=100m `
+            --set replicaCount=1 `
+            --wait --timeout=10m
+          
+          Write-Host "RabbitMQ deployed successfully for testing"
+    
+    - task: AzureCLI@2
+      displayName: 'Update Test Secrets in Key Vault'
+      inputs:
+        azureSubscription: '$(azureServiceConnection)'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          # Update Redis connection string
+          az keyvault secret set \
+            --vault-name "$(keyVaultName)" \
+            --name "redis-connection" \
+            --value "redis-test-master.test.svc.cluster.local:6379"
+          
+          # Update RabbitMQ connection string
+          az keyvault secret set \
+            --vault-name "$(keyVaultName)" \
+            --name "rabbitmq-connection" \
+            --value "amqp://testuser:testpass@rabbitmq-test.test.svc.cluster.local:5672/"
+          
+          echo "Test secrets updated in Key Vault"
+
+# Stage 4: Deploy Services to Test Environment
+- stage: DeployServicesToTest
+  displayName: 'Deploy Services to Test Environment'
+  dependsOn: 
+    - DeployTestDependencies
+  variables:
+    clusterName: $[ dependencies.ProvisionTestInfrastructure.outputs['TerraformTestInfra.TestConfig.clusterName'] ]
+    keyVaultName: $[ dependencies.ProvisionTestInfrastructure.outputs['TerraformTestInfra.TestConfig.keyVaultName'] ]
+  
+  jobs:
+  - template: templates/deploy-services-test.yml
+    parameters:
+      environmentName: 'test'
+      servicesToDeploy: ${{ parameters.servicesToTest }}
+      keyVaultName: $(keyVaultName)
+      enableDebugMode: true
+      enableTestEndpoints: true
+
+# Stage 5: Execute Test Suite
+- stage: ExecuteTestSuite
+  displayName: 'Execute Test Suite'
+  dependsOn: DeployServicesToTest
+  condition: and(succeeded(), eq('${{ parameters.runFullTestSuite }}', 'true'))
+  jobs:
+  - job: UnitTests
+    displayName: 'Unit Tests'
+    condition: or(eq('${{ parameters.testType }}', 'unit'), eq('${{ parameters.testType }}', 'all'))
+    pool:
+      vmImage: 'ubuntu-latest'
+    
+    steps:
+    - template: templates/run-unit-tests.yml
+      parameters:
+        servicesToTest: ${{ parameters.servicesToTest }}
+  
+  - job: IntegrationTests
+    displayName: 'Integration Tests'
+    condition: or(eq('${{ parameters.testType }}', 'integration'), eq('${{ parameters.testType }}', 'all'))
+    pool:
+      vmImage: 'ubuntu-latest'
+    
+    steps:
+    - template: templates/run-integration-tests.yml
+      parameters:
+        servicesToTest: ${{ parameters.servicesToTest }}
+        testEnvironment: 'test'
+        keyVaultName: $[ dependencies.ProvisionTestInfrastructure.outputs['TerraformTestInfra.TestConfig.keyVaultName'] ]
+  
+  - job: EndToEndTests
+    displayName: 'End-to-End Tests'
+    condition: or(eq('${{ parameters.testType }}', 'e2e'), eq('${{ parameters.testType }}', 'all'))
+    dependsOn: IntegrationTests
+    pool:
+      vmImage: 'ubuntu-latest'
+    
+    steps:
+    - template: templates/run-e2e-tests.yml
+      parameters:
+        servicesToTest: ${{ parameters.servicesToTest }}
+        testEnvironment: 'test'
+  
+  - job: LoadTests
+    displayName: 'Load Tests'
+    condition: or(eq('${{ parameters.testType }}', 'load'), eq('${{ parameters.testType }}', 'all'))
+    dependsOn: EndToEndTests
+    pool:
+      vmImage: 'ubuntu-latest'
+    
+    steps:
+    - template: templates/run-load-tests.yml
+      parameters:
+        servicesToTest: ${{ parameters.servicesToTest }}
+        testEnvironment: 'test'
+
+# Stage 6: Test Results Analysis
+- stage: TestResultsAnalysis
+  displayName: 'Test Results Analysis'
+  dependsOn: ExecuteTestSuite
+  condition: always()
+  jobs:
+  - job: AnalyzeTestResults
+    displayName: 'Analyze Test Results'
+    pool:
+      vmImage: 'ubuntu-latest'
+    
+    steps:
+    - task: DownloadPipelineArtifact@2
+      displayName: 'Download Test Results'
+      inputs:
+        artifactName: 'test-results'
+        targetPath: '$(System.ArtifactsDirectory)/test-results'
+      continueOnError: true
+    
+    - task: PowerShell@2
+      displayName: 'Generate Test Report'
+      inputs:
+        targetType: 'inline'
+        script: |
+          $testResultsPath = "$(System.ArtifactsDirectory)/test-results"
+          
+          # Analyze test results
+          $testSummary = @{
+            TotalTests = 0
+            PassedTests = 0
+            FailedTests = 0
+            SkippedTests = 0
+            TestCoverage = "N/A"
+            TestDuration = "N/A"
+            Environment = "test"
+            Timestamp = Get-Date -Format "yyyy-MM-ddTHH:mm:ssZ"
+          }
+          
+          # Parse test result files if they exist
+          if (Test-Path $testResultsPath) {
+            $testFiles = Get-ChildItem -Path $testResultsPath -Recurse -Filter "*.xml" -ErrorAction SilentlyContinue
+            
+            foreach ($file in $testFiles) {
+              Write-Host "Processing test results from: $($file.Name)"
+              # Add logic to parse XML test results
+            }
+          }
+          
+          # Generate HTML report
+          $htmlReport = @"
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Test Environment Results</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        .summary { background-color: #f0f8ff; padding: 15px; border-radius: 5px; }
+        .passed { color: green; }
+        .failed { color: red; }
+        .skipped { color: orange; }
+    </style>
+</head>
+<body>
+    <h1>Test Environment Results</h1>
+    <div class="summary">
+        <h2>Summary</h2>
+        <p><strong>Environment:</strong> $($testSummary.Environment)</p>
+        <p><strong>Timestamp:</strong> $($testSummary.Timestamp)</p>
+        <p><strong>Total Tests:</strong> $($testSummary.TotalTests)</p>
+        <p class="passed"><strong>Passed:</strong> $($testSummary.PassedTests)</p>
+        <p class="failed"><strong>Failed:</strong> $($testSummary.FailedTests)</p>
+        <p class="skipped"><strong>Skipped:</strong> $($testSummary.SkippedTests)</p>
+        <p><strong>Coverage:</strong> $($testSummary.TestCoverage)</p>
+    </div>
+</body>
+</html>
+"@
+          
+          $htmlReport | Out-File -FilePath "$(Build.ArtifactStagingDirectory)/test-report.html" -Encoding UTF8
+          
+          Write-Host "Test analysis completed"
+    
+    - task: PublishPipelineArtifact@1
+      displayName: 'Publish Test Report'
+      inputs:
+        targetPath: '$(Build.ArtifactStagingDirectory)'
+        artifactName: 'test-analysis-report'
+
+# Stage 7: Cleanup Test Environment
+- stage: CleanupTestEnvironment
+  displayName: 'Cleanup Test Environment'
+  dependsOn: 
+    - TestResultsAnalysis
+  condition: and(always(), eq('${{ parameters.cleanupAfterTests }}', 'true'))
+  jobs:
+  - job: CleanupResources
+    displayName: 'Cleanup Test Resources'
+    pool:
+      vmImage: 'ubuntu-latest'
+    
+    steps:
+    - task: TerraformInstaller@1
+      displayName: 'Install Terraform'
+      inputs:
+        terraformVersion: '1.6.0'
+    
+    - task: TerraformTaskV4@4
+      displayName: 'Terraform Init'
+      inputs:
+        provider: 'azurerm'
+        command: 'init'
+        workingDirectory: '$(terraformWorkingDirectory)'
+        backendServiceArm: '$(azureServiceConnection)'
+        backendAzureRmResourceGroupName: 'mycai_test-rg'
+        backendAzureRmStorageAccountName: 'tfstatetestcai'
+        backendAzureRmContainerName: 'tfstatetestcai'
+        backendAzureRmKey: 'test.terraform.tfstate'
+    
+    - task: PowerShell@2
+      displayName: 'Selective Cleanup Decision'
+      inputs:
+        targetType: 'inline'
+        script: |
+          # Check if tests passed to determine cleanup strategy
+          $testsPassed = $true  # This should be determined from previous stages
+          
+          if ($testsPassed) {
+            Write-Host "Tests passed - proceeding with full cleanup"
+            Write-Host "##vso[task.setVariable variable=performFullCleanup]true"
+          } else {
+            Write-Host "Tests failed - preserving environment for debugging"
+            Write-Host "##vso[task.setVariable variable=performFullCleanup]false"
+          }
+    
+    - task: TerraformTaskV4@4
+      displayName: 'Terraform Destroy'
+      condition: eq(variables['performFullCleanup'], 'true')
+      inputs:
+        provider: 'azurerm'
+        command: 'destroy'
+        workingDirectory: '$(terraformWorkingDirectory)'
+        environmentServiceNameAzureRM: '$(azureServiceConnection)'
+        commandOptions: '-auto-approve'
+    
+    - task: PowerShell@2
+      displayName: 'Cleanup Summary'
+      inputs:
+        targetType: 'inline'
+        script: |
+          if ("$(performFullCleanup)" -eq "true") {
+            Write-Host "✅ Test environment cleaned up successfully"
+            Write-Host "##vso[task.logissue type=warning]Test environment destroyed - resources cleaned up"
+          } else {
+            Write-Host "⚠️ Test environment preserved for debugging"
+            Write-Host "##vso[task.logissue type=warning]Test environment preserved due to test failures"
+            Write-Host "Manual cleanup required for resource group: mycai_test-rg"
+          }
+          
+          # Set cleanup status for downstream processes
+          Write-Host "##vso[task.setVariable variable=cleanupCompleted;isOutput=true]$(performFullCleanup)"

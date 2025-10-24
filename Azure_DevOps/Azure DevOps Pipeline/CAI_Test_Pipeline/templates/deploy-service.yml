@@ -1,0 +1,125 @@
+parameters:
+  - name: serviceName
+    type: string
+  - name: configPath
+    type: string
+  - name: keyVaults
+    type: object
+  - name: envFromParamServiceVersions
+    type: object
+    default: {}
+
+jobs:
+  - job: Deploy_${{ parameters.serviceName }}
+    displayName: 'Deploy ${{ parameters.serviceName }}'
+    pool:
+      vmImage: 'ubuntu-latest'
+    timeoutInMinutes: 120
+    steps:
+      - checkout: self
+
+      - task: UsePythonVersion@0
+        inputs:
+          versionSpec: '3.x'
+        displayName: 'Optional: ensure python for helper scripts'
+
+      - script: |
+          echo "Ensuring jq and yq are installed"
+          if ! command -v jq >/dev/null 2>&1; then sudo apt-get update && sudo apt-get install -y jq; fi
+          if ! command -v yq >/dev/null 2>&1; then
+            wget https://github.com/mikefarah/yq/releases/download/v4.34.1/yq_linux_amd64 -O /usr/bin/yq && chmod +x /usr/bin/yq
+          fi
+        displayName: 'Install jq and yq'
+
+      - script: |
+          set -euo pipefail
+          SERVICE_NAME='${{ parameters.serviceName }}'
+          ENV='${{ parameters['deployment.environment'] || parameters.serviceName }}' || true
+          ENV='${{ parameters.serviceName }}' || true
+          ENV='${{ parameters.serviceName }}' || true
+          # Better: get environment from pipeline parameter passed down
+          ENV_PARAM='${{ parameters.serviceName }}'
+
+          echo "Loading service versions file for pipeline environment: ${{ parameters.serviceName }}"
+
+          VERSIONS_FILE="ops/service-versions/${{ parameters.serviceName }}.json"
+          # fallback: environment-level file
+          if [[ -f "ops/service-versions/${{ parameters.serviceName }}.json" ]]; then
+            echo "Found per-service versions file"
+          fi
+
+          # We'll merge pipeline parameter overrides (pipeline-level param envFromParamServiceVersions) with file values
+          # Write merged to $(Pipeline.Workspace)/merged_service_versions.json
+
+          PARAM_OVERRIDES='${{ toJson(parameters.envFromParamServiceVersions) }}'
+          echo "$PARAM_OVERRIDES" > $(Pipeline.Workspace)/param_overrides.json
+
+          if [[ -f "ops/service-versions/${{ parameters.serviceName }}.json" ]]; then
+            jq -s '.[0] * .[1]' ops/service-versions/${{ parameters.serviceName }}.json $(Pipeline.Workspace)/param_overrides.json > $(Pipeline.Workspace)/merged_service_versions.json || true
+          else
+            cp $(Pipeline.Workspace)/param_overrides.json $(Pipeline.Workspace)/merged_service_versions.json || true
+          fi
+
+          SERVICE_TAG=$(jq -r --arg svc "$SERVICE_NAME" '.[$svc] // "latest"' $(Pipeline.Workspace)/merged_service_versions.json)
+          echo "Service tag for $SERVICE_NAME => $SERVICE_TAG"
+          echo "##vso[task.setvariable variable=${SERVICE_NAME^^}_IMAGE_TAG]$SERVICE_TAG"
+        displayName: 'Merge serviceVersions and determine tag'
+
+      - task: AzureKeyVault@2
+        displayName: 'Fetch secrets for service'
+        inputs:
+          azureSubscription: '$(AZURE_SERVICE_CONNECTION)'
+          KeyVaultName: ${{ parameters.keyVaults[parameters.environment] }}
+          SecretsFilter: '${{ parameters.serviceName }}*'
+          RunAsPreJob: false
+
+      - script: |
+          set -euo pipefail
+          echo "Generating merged Helm values for ${{ parameters.serviceName }}"
+          mkdir -p $(Pipeline.Workspace)/final-values
+
+          # Start with global
+          if [[ -f "${{ parameters.configPath }}/global/common.values.yaml" ]]; then
+            yq eval-all 'select(fileIndex==0) * select(fileIndex==1)' ${ { parameters.configPath }}/global/common.values.yaml || true
+          fi
+
+          # Compose value files: global -> env -> service -> secrets
+          value_files=("${{ parameters.configPath }}/global/common.values.yaml" "${{ parameters.configPath }}/${{ parameters.environment }}/${{ parameters.serviceName }}.values.yaml" "$(Pipeline.Workspace)/secrets/${{ parameters.serviceName }}.secrets.yaml")
+
+          # Merge the existing files using yq merge
+          MERGED_FILE=$(Pipeline.Workspace)/final-values/${{ parameters.serviceName }}.merged.yaml
+          # Start with empty file
+          echo "{}" > $MERGED_FILE
+          for f in "${value_files[@]}"; do
+            if [[ -f "$f" ]]; then
+              /usr/bin/yq eval-all 'select(fileIndex==0) * select(fileIndex==1)' $MERGED_FILE $f > $MERGED_FILE.tmp && mv $MERGED_FILE.tmp $MERGED_FILE
+            fi
+          done
+
+          echo "Final merged values written to $MERGED_FILE"
+          cat $MERGED_FILE
+
+          # Build Helm override --image.tag or --set
+          IMAGE_REPO="contoso/${{ parameters.serviceName }}"
+          IMAGE_TAG="$(echo $SERVICE_TAG)"
+
+          echo "Running helm upgrade --install for ${{ parameters.serviceName }}"
+
+          helm upgrade --install ${ { parameters.serviceName }}-${{ parameters.environment }} charts/generic-service \
+            --namespace ${ { parameters.serviceName }}-${{ parameters.environment }} --create-namespace \
+            --values $MERGED_FILE \
+            --set image.repository=$IMAGE_REPO,image.tag=$IMAGE_TAG
+
+          # Wait for rollout
+          kubectl rollout status deployment/${{ parameters.serviceName }} -n ${ { parameters.serviceName }}-${{ parameters.environment }} --timeout=3m
+
+        displayName: 'Merge values + Helm upgrade'
+
+      - script: |
+          set -e
+          echo "Post-deploy health checks"
+          # Simple health probe, replace with real endpoint
+          POD=$(kubectl get pods -n ${ { parameters.serviceName }}-${{ parameters.environment }} -l app=${{ parameters.serviceName }} -o jsonpath='{.items[0].metadata.name}')
+          echo "Checking logs for $POD"
+          kubectl get pod $POD -n ${ { parameters.serviceName }}-${{ parameters.environment }}
+        displayName: 'Post-deploy verification'
