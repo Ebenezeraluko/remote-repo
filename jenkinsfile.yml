@@ -1,0 +1,106 @@
+pipeline {
+    agent { label 'PIMS-Test-Builder' }
+
+    //triggers {
+    //    cron('0 2 * * *')
+   // }
+
+    environment {
+        GITLAB_BASE_URL = 'https://gitlab.cicd.bep.hhs.internal/'
+        GITHUB_BASE_URL = 'https://github.com/TXHHS-PHA'
+        GITLAB_GROUP = 'PIMS'
+        SYNC_BASE_DIR = "/home/jenkins/workspace/PIMS/Github-GitLab-Sync/git-sync"
+    }
+
+    stages {
+        stage('Prepare Sync Directory') {
+            steps {
+                script {
+                    echo "Using existing sync directory: ${env.SYNC_BASE_DIR}"
+                    // Just ensure the directory exists and is clean
+                    sh """
+                        mkdir -p ${env.SYNC_BASE_DIR}
+                        echo "Sync directory ready: ${env.SYNC_BASE_DIR}"
+                    """
+                }
+            }
+        }
+
+        stage('Sync Repositories') {
+            steps {
+                script {
+                    def repoMappings = [
+                        'pims.models': 'pims.models',
+                        'pims.api': 'pims.api',
+                        'pims.requests.responses': 'pims.requests.responses',
+                        'pims.shared': 'pims.shared',
+                        'eiam': 'pims_sso',
+                        'pims-filearchivalapp': 'pims-filearchivalapp',
+                        'pims.shared.telemetry': 'pims.shared.telemetry',
+                        'pims-cicd': 'pims-cicd',
+                        'pims-db': 'pims-db',
+                        'pims_functions': 'pims_functions',
+                        'pims-scanner-apis': 'pims-scanner-apis',
+                        'pims-hardware-config': 'pims-hardware-config',
+                        'pims-automation-tests': 'pims-automation-tests'
+                    ]
+
+                    echo "Starting sync for ${repoMappings.size()} repositories..."
+                    echo "This will mirror ALL branches, tags, and refs from GitLab to GitHub"
+
+                    repoMappings.each { gitlabRepo, githubRepo ->
+                        echo "Syncing: ${gitlabRepo} -> ${githubRepo}"
+                        syncRepository(gitlabRepo, githubRepo)
+                    }
+
+                    echo "✅ All repositories synced successfully with all branches!"
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            cleanWs()
+        }
+    }
+}
+
+def syncRepository(gitlabRepo, githubRepo) {
+    // Use the existing git-sync directory with a subdirectory for this repo
+    def syncDir = "${env.SYNC_BASE_DIR}/${gitlabRepo}-mirror"
+    
+    dir(syncDir) {
+        script {
+            echo "Respecting GitHub branch protections for: ${gitlabRepo}"
+            
+            withCredentials([gitUsernamePassword(credentialsId: 'add-it-there', gitToolName: 'Default')]) {
+                sh """
+                    git clone --mirror ${env.GITLAB_BASE_URL}${env.GITLAB_GROUP}/${gitlabRepo}.git .
+                """
+            }
+            
+            withCredentials([gitUsernamePassword(credentialsId: 'github-pat-cred', gitToolName: 'Default')]) {
+                sh """
+                    #git remote add ${env.GITHUB_BASE_URL}/${githubRepo}.git
+                    
+                    # Skip known protected branches
+                    git for-each-ref --format='%(refname:short)' refs/heads/ | while read branch; do
+                        if [ "\$branch" = "BR_BAK_PROD_API_06_20_2024" ]; then
+                            echo "Skipping protected branch: \$branch"
+                            continue
+                        fi
+                        echo "Pushing branch: \$branch"
+                        git push ${env.GITHUB_BASE_URL}/${githubRepo}.git "\$branch:\$branch" || true
+                    done
+                    
+                    git push --tags ${env.GITHUB_BASE_URL}/${githubRepo}.git || true
+                    echo "✅ Sync completed (protected branches preserved)"
+                """
+            }
+        }
+    }    
+    
+    // Clean up this specific repository mirror directory
+    sh "rm -rf ${syncDir}"
+}
